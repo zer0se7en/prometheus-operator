@@ -401,6 +401,14 @@ type PrometheusSpec struct {
 	// entire scrape will be treated as failed. 0 means no limit.
 	// Only valid in Prometheus versions 2.27.0 and newer.
 	EnforcedLabelValueLengthLimit *uint64 `json:"enforcedLabelValueLengthLimit,omitempty"`
+	// EnforcedBodySizeLimit defines the maximum size of uncompressed response body
+	// that will be accepted by Prometheus. Targets responding with a body larger than this many bytes
+	// will cause the scrape to fail. Example: 100MB.
+	// If defined, the limit will apply to all service/pod monitors and probes.
+	// This is an experimental feature, this behaviour could
+	// change or be removed in the future.
+	// Only valid in Prometheus versions 2.28.0 and newer.
+	EnforcedBodySizeLimit string `json:"enforcedBodySizeLimit,omitempty"`
 	// Minimum number of seconds for which a newly created pod should be ready
 	// without any of its container crashing for it to be considered available.
 	// Defaults to 0 (pod will be considered available as soon as it is ready)
@@ -698,6 +706,8 @@ type RemoteWriteSpec struct {
 	BearerTokenFile string `json:"bearerTokenFile,omitempty"`
 	// Authorization section for remote write
 	Authorization *Authorization `json:"authorization,omitempty"`
+	// Sigv4 allows to configures AWS's Signature Verification 4
+	Sigv4 *Sigv4 `json:"sigv4,omitempty"`
 	// TLS Config to use for remote write.
 	TLSConfig *TLSConfig `json:"tlsConfig,omitempty"`
 	// Optional ProxyURL
@@ -728,6 +738,22 @@ type QueueConfig struct {
 	MinBackoff string `json:"minBackoff,omitempty"`
 	// MaxBackoff is the maximum retry delay.
 	MaxBackoff string `json:"maxBackoff,omitempty"`
+}
+
+// Sigv4 optionally configures AWS's Signature Verification 4 signing process to
+// sign requests. Cannot be set at the same time as basic_auth or authorization.
+// +k8s:openapi-gen=true
+type Sigv4 struct {
+	// Region is the AWS region. If blank, the region from the default credentials chain used.
+	Region string `json:"region,omitempty"`
+	// AccessKey is the AWS API key. If blank, the environment variable `AWS_ACCESS_KEY_ID` is used.
+	AccessKey *v1.SecretKeySelector `json:"accessKey,omitempty"`
+	// SecretKey is the AWS API secret. If blank, the environment variable `AWS_SECRET_ACCESS_KEY` is used.
+	SecretKey *v1.SecretKeySelector `json:"secretKey,omitempty"`
+	// Profile is the named AWS profile used to authenticate.
+	Profile string `json:"profile,omitempty"`
+	// RoleArn is the named AWS profile used to authenticate.
+	RoleArn string `json:"roleArn,omitempty"`
 }
 
 // RemoteReadSpec defines the remote_read configuration for prometheus.

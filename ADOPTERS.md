@@ -1,7 +1,7 @@
 ---
-title: "Adopters"
-date: 2021-03-08T23:50:39+01:00
+title: Adopters
 draft: false
+date: "2021-03-08T23:50:39+01:00"
 ---
 
 <!--
@@ -27,7 +27,7 @@ This document tracks people and use cases for the Prometheus Operator in product
 
 Go ahead and [add your organization](https://github.com/prometheus-operator/prometheus-operator/edit/master/ADOPTERS.md) to the list.
 
-## Clyso 
+## Clyso
 
 [clyso.com](https://www.clyso.com/en)
 
@@ -40,6 +40,21 @@ Details:
 - several own ceph cluster providing metrics via ceph mgr prometheus module
 - several customer ceph clusters pushing metrics via external pushgateway to our our central monitoring instances
 - thanos receiver connected to own S3 storage
+
+## Coralogix
+
+[coralogix.com](https://coralogix.com)
+
+Environments: AWS
+
+Uses [kube-prometheus](https://github.com/prometheus-operator/kube-prometheus): Yes
+
+Details:
+- Operator installed on each Kubernetes cluster, with Thanos aggregating metrics from a central query endpoint
+- Two Prometheus instances per cluster
+- Loose coupling between Kubernetes cluster administrators who manage alerting sinks and service owners who define alerts for their services
+- 800K samples/s
+- 30M active series
 
 ## Giant Swarm
 
@@ -68,7 +83,7 @@ Details:
 - 20000 samples/s
 - 1M active series
 
-## Innovaccer ##
+## Innovaccer
 
 https://innovaccer.com/
 

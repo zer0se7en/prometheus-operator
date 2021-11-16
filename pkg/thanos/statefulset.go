@@ -121,6 +121,14 @@ func makeStatefulSet(tr *monitoringv1.ThanosRuler, config Config, ruleConfigMapN
 				EmptyDir: emptyDir,
 			},
 		})
+	} else if storageSpec.Ephemeral != nil {
+		ephemeral := storageSpec.Ephemeral
+		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
+			Name: volumeName(tr.Name),
+			VolumeSource: v1.VolumeSource{
+				Ephemeral: ephemeral,
+			},
+		})
 	} else {
 		pvcTemplate := operator.MakeVolumeClaimTemplate(storageSpec.VolumeClaimTemplate)
 		if pvcTemplate.Name == "" {
@@ -164,8 +172,21 @@ func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfig
 	if tr.Spec.EvaluationInterval == "" {
 		tr.Spec.EvaluationInterval = defaultEvaluationInterval
 	}
+
+	if tr.Spec.EvaluationInterval != "" {
+		if err := operator.ValidateDurationField(tr.Spec.EvaluationInterval); err != nil {
+			return nil, errors.Wrap(err, "invalid evaluationInterval value specified")
+		}
+	}
+
 	if tr.Spec.Retention == "" {
 		tr.Spec.Retention = defaultRetention
+	}
+
+	if tr.Spec.Retention != "" {
+		if err := operator.ValidateDurationField(tr.Spec.Retention); err != nil {
+			return nil, errors.Wrap(err, "invalid retention value specified")
+		}
 	}
 
 	trCLIArgs := []string{
@@ -359,8 +380,6 @@ func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfig
 			}
 		}
 	}
-	// TODO(paulfantom): remove `app` label after 0.50 release
-	podLabels["app"] = thanosRulerLabel
 	podLabels["app.kubernetes.io/name"] = thanosRulerLabel
 	podLabels["app.kubernetes.io/managed-by"] = "prometheus-operator"
 	podLabels["app.kubernetes.io/instance"] = tr.Name

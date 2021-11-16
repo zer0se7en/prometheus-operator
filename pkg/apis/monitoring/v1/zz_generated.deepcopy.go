@@ -1476,6 +1476,13 @@ func (in *RemoteReadSpec) DeepCopyInto(out *RemoteReadSpec) {
 			(*out)[key] = val
 		}
 	}
+	if in.Headers != nil {
+		in, out := &in.Headers, &out.Headers
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	if in.BasicAuth != nil {
 		in, out := &in.BasicAuth, &out.BasicAuth
 		*out = new(BasicAuth)
@@ -1853,6 +1860,11 @@ func (in *StorageSpec) DeepCopyInto(out *StorageSpec) {
 	if in.EmptyDir != nil {
 		in, out := &in.EmptyDir, &out.EmptyDir
 		*out = new(corev1.EmptyDirVolumeSource)
+		(*in).DeepCopyInto(*out)
+	}
+	if in.Ephemeral != nil {
+		in, out := &in.Ephemeral, &out.Ephemeral
+		*out = new(corev1.EphemeralVolumeSource)
 		(*in).DeepCopyInto(*out)
 	}
 	in.VolumeClaimTemplate.DeepCopyInto(&out.VolumeClaimTemplate)

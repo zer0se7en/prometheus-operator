@@ -25,15 +25,16 @@ import (
 	"github.com/blang/semver/v4"
 	"github.com/go-kit/log"
 	"github.com/google/go-cmp/cmp"
+	monitoringv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
 	"github.com/prometheus-operator/prometheus-operator/pkg/assets"
 	"github.com/prometheus/alertmanager/config"
+	"github.com/prometheus/alertmanager/timeinterval"
 	"github.com/prometheus/common/model"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
-
-	monitoringv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
 )
 
 func TestGenerateConfig(t *testing.T) {
@@ -41,6 +42,7 @@ func TestGenerateConfig(t *testing.T) {
 		name       string
 		kclient    kubernetes.Interface
 		baseConfig alertmanagerConfig
+		amVersion  *semver.Version
 		amConfigs  map[string]*monitoringv1alpha1.AlertmanagerConfig
 		expected   string
 	}
@@ -187,6 +189,72 @@ templates: []
 `,
 		},
 		{
+			name:    "skeleton base with mute time intervals, no CRs",
+			kclient: fake.NewSimpleClientset(),
+			baseConfig: alertmanagerConfig{
+				Route:     &route{Receiver: "null"},
+				Receivers: []*receiver{{Name: "null"}},
+				MuteTimeIntervals: []muteTimeInterval{
+					{
+						Name: "maintenance_windows",
+						TimeIntervals: []timeinterval.TimeInterval{
+							{
+								Months: []timeinterval.MonthRange{
+									{
+										InclusiveRange: timeinterval.InclusiveRange{
+											Begin: 1,
+											End:   1,
+										},
+									},
+								},
+								DaysOfMonth: []timeinterval.DayOfMonthRange{
+									{
+										InclusiveRange: timeinterval.InclusiveRange{
+											Begin: 7,
+											End:   7,
+										},
+									},
+									{
+										InclusiveRange: timeinterval.InclusiveRange{
+											Begin: 18,
+											End:   18,
+										},
+									},
+									{
+										InclusiveRange: timeinterval.InclusiveRange{
+											Begin: 28,
+											End:   28,
+										},
+									},
+								},
+								Times: []timeinterval.TimeRange{
+									{
+										StartMinute: 1020,
+										EndMinute:   1440,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			amConfigs: map[string]*monitoringv1alpha1.AlertmanagerConfig{},
+			expected: `route:
+  receiver: "null"
+receivers:
+- name: "null"
+mute_time_intervals:
+- name: maintenance_windows
+  time_intervals:
+  - times:
+    - start_time: "17:00"
+      end_time: "24:00"
+    days_of_month: ["7", "18", "28"]
+    months: ["1"]
+templates: []
+`,
+		},
+		{
 			name:    "skeleton base, simple CR",
 			kclient: fake.NewSimpleClientset(),
 			baseConfig: alertmanagerConfig{
@@ -211,8 +279,8 @@ templates: []
   receiver: "null"
   routes:
   - receiver: mynamespace-myamc-test
-    match:
-      namespace: mynamespace
+    matchers:
+    - namespace="mynamespace"
     continue: true
 receivers:
 - name: "null"
@@ -221,11 +289,15 @@ templates: []
 `,
 		},
 		{
-			name:    "skeleton base, CR with inhibition rules only (deprecated matchers)",
+			name:    "skeleton base, CR with inhibition rules only (deprecated matchers not converted)",
 			kclient: fake.NewSimpleClientset(),
 			baseConfig: alertmanagerConfig{
 				Route:     &route{Receiver: "null"},
 				Receivers: []*receiver{{Name: "null"}},
+			},
+			amVersion: &semver.Version{
+				Major: 0,
+				Minor: 20,
 			},
 			amConfigs: map[string]*monitoringv1alpha1.AlertmanagerConfig{
 				"mynamespace": {
@@ -271,6 +343,109 @@ templates: []
 `,
 		},
 		{
+			name:    "skeleton base, CR with inhibition rules only (deprecated matchers are converted)",
+			kclient: fake.NewSimpleClientset(),
+			baseConfig: alertmanagerConfig{
+				Route:     &route{Receiver: "null"},
+				Receivers: []*receiver{{Name: "null"}},
+			},
+			amConfigs: map[string]*monitoringv1alpha1.AlertmanagerConfig{
+				"mynamespace": {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "myamc",
+						Namespace: "mynamespace",
+					},
+					Spec: monitoringv1alpha1.AlertmanagerConfigSpec{
+						InhibitRules: []monitoringv1alpha1.InhibitRule{
+							{
+								SourceMatch: []monitoringv1alpha1.Matcher{
+									{
+										Name:  "alertname",
+										Value: "NodeNotReady",
+										Regex: true,
+									},
+								},
+								TargetMatch: []monitoringv1alpha1.Matcher{
+									{
+										Name:  "alertname",
+										Value: "TargetDown",
+									},
+								},
+								Equal: []string{"node"},
+							},
+						},
+					},
+				},
+			},
+			expected: `route:
+  receiver: "null"
+inhibit_rules:
+- target_matchers:
+  - alertname="TargetDown"
+  - namespace="mynamespace"
+  source_matchers:
+  - alertname=~"NodeNotReady"
+  - namespace="mynamespace"
+  equal:
+  - node
+receivers:
+- name: "null"
+templates: []
+`,
+		},
+		{
+			name:    "skeleton base, CR with inhibition rules only",
+			kclient: fake.NewSimpleClientset(),
+			baseConfig: alertmanagerConfig{
+				Route:     &route{Receiver: "null"},
+				Receivers: []*receiver{{Name: "null"}},
+			},
+			amConfigs: map[string]*monitoringv1alpha1.AlertmanagerConfig{
+				"mynamespace": {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "myamc",
+						Namespace: "mynamespace",
+					},
+					Spec: monitoringv1alpha1.AlertmanagerConfigSpec{
+						InhibitRules: []monitoringv1alpha1.InhibitRule{
+							{
+								SourceMatch: []monitoringv1alpha1.Matcher{
+									{
+										Name:      "alertname",
+										MatchType: monitoringv1alpha1.MatchRegexp,
+										Value:     "NodeNotReady",
+									},
+								},
+								TargetMatch: []monitoringv1alpha1.Matcher{
+									{
+										Name:      "alertname",
+										MatchType: monitoringv1alpha1.MatchNotEqual,
+										Value:     "TargetDown",
+									},
+								},
+								Equal: []string{"node"},
+							},
+						},
+					},
+				},
+			},
+			expected: `route:
+  receiver: "null"
+inhibit_rules:
+- target_matchers:
+  - alertname!="TargetDown"
+  - namespace="mynamespace"
+  source_matchers:
+  - alertname=~"NodeNotReady"
+  - namespace="mynamespace"
+  equal:
+  - node
+receivers:
+- name: "null"
+templates: []
+`,
+		},
+		{
 			name:    "base with subroute - deprecated matching pattern, simple CR",
 			kclient: fake.NewSimpleClientset(),
 			baseConfig: alertmanagerConfig{
@@ -298,8 +473,8 @@ templates: []
   receiver: "null"
   routes:
   - receiver: mynamespace-myamc-test
-    match:
-      namespace: mynamespace
+    matchers:
+    - namespace="mynamespace"
     continue: true
   - receiver: "null"
 receivers:
@@ -355,8 +530,8 @@ templates: []
   receiver: "null"
   routes:
   - receiver: mynamespace-myamc-test-pd
-    match:
-      namespace: mynamespace
+    matchers:
+    - namespace="mynamespace"
     continue: true
 receivers:
 - name: "null"
@@ -400,8 +575,8 @@ templates: []
   receiver: "null"
   routes:
   - receiver: mynamespace-myamc-test
-    match:
-      namespace: mynamespace
+    matchers:
+    - namespace="mynamespace"
     continue: true
 receivers:
 - name: "null"
@@ -458,8 +633,8 @@ templates: []
   receiver: "null"
   routes:
   - receiver: mynamespace-myamc-test
-    match:
-      namespace: mynamespace
+    matchers:
+    - namespace="mynamespace"
     continue: true
 receivers:
 - name: "null"
@@ -520,8 +695,8 @@ templates: []
   receiver: "null"
   routes:
   - receiver: mynamespace-myamc-test
-    match:
-      namespace: mynamespace
+    matchers:
+    - namespace="mynamespace"
     continue: true
 receivers:
 - name: "null"
@@ -582,8 +757,8 @@ templates: []
   receiver: "null"
   routes:
   - receiver: mynamespace-myamc-test
-    match:
-      namespace: mynamespace
+    matchers:
+    - namespace="mynamespace"
     continue: true
 receivers:
 - name: "null"
@@ -647,8 +822,8 @@ route:
   receiver: "null"
   routes:
   - receiver: mynamespace-myamc-test
-    match:
-      namespace: mynamespace
+    matchers:
+    - namespace="mynamespace"
     continue: true
 receivers:
 - name: "null"
@@ -719,8 +894,8 @@ route:
   receiver: "null"
   routes:
   - receiver: mynamespace-myamc-test
-    match:
-      namespace: mynamespace
+    matchers:
+    - namespace="mynamespace"
     continue: true
 receivers:
 - name: "null"
@@ -740,16 +915,20 @@ templates: []
 		},
 	}
 
-	version, err := semver.ParseTolerant("v0.22.2")
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	logger := log.NewNopLogger()
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := assets.NewStore(tc.kclient.CoreV1(), tc.kclient.CoreV1())
-			cg := newConfigGenerator(logger, version, store)
+
+			if tc.amVersion == nil {
+				version, err := semver.ParseTolerant("v0.22.2")
+				if err != nil {
+					t.Fatal(err)
+				}
+				tc.amVersion = &version
+			}
+
+			cg := newConfigGenerator(logger, *tc.amVersion, store)
 			cfgBytes, err := cg.generateConfig(context.Background(), tc.baseConfig, tc.amConfigs)
 			if err != nil {
 				t.Fatal(err)
@@ -1252,5 +1431,99 @@ func TestSanitizeRoute(t *testing.T) {
 				t.Fatalf("wanted %v but got %v", tc.expect, out)
 			}
 		})
+	}
+}
+
+// We want to ensure that the imported types from config.MuteTimeInterval
+// and any others with custom marshalling/unmarshalling are parsed
+// into the internal struct as expected
+func TestLoadConfig(t *testing.T) {
+	testCase := []struct {
+		name     string
+		rawConf  string
+		expected *alertmanagerConfig
+	}{
+		{
+			name: "Test mute_time_intervals",
+			rawConf: `route:
+  receiver: "null"
+receivers:
+- name: "null"
+mute_time_intervals:
+- name: maintenance_windows
+  time_intervals:
+  - times:
+    - start_time: "17:00"
+      end_time: "24:00"
+    days_of_month: ["7", "18", "28"]
+    months: ["january"]
+templates: []
+`,
+			expected: &alertmanagerConfig{
+				Global: nil,
+				Route: &route{
+					Receiver: "null",
+				},
+				Receivers: []*receiver{
+					{
+						Name: "null",
+					},
+				},
+				MuteTimeIntervals: []muteTimeInterval{
+					{
+						Name: "maintenance_windows",
+						TimeIntervals: []timeinterval.TimeInterval{
+							{
+								Months: []timeinterval.MonthRange{
+									{
+										InclusiveRange: timeinterval.InclusiveRange{
+											Begin: 1,
+											End:   1,
+										},
+									},
+								},
+								DaysOfMonth: []timeinterval.DayOfMonthRange{
+									{
+										InclusiveRange: timeinterval.InclusiveRange{
+											Begin: 7,
+											End:   7,
+										},
+									},
+									{
+										InclusiveRange: timeinterval.InclusiveRange{
+											Begin: 18,
+											End:   18,
+										},
+									},
+									{
+										InclusiveRange: timeinterval.InclusiveRange{
+											Begin: 28,
+											End:   28,
+										},
+									},
+								},
+								Times: []timeinterval.TimeRange{
+									{
+										StartMinute: 1020,
+										EndMinute:   1440,
+									},
+								},
+							},
+						},
+					},
+				},
+				Templates: []string{},
+			},
+		},
+	}
+
+	for _, tc := range testCase {
+		ac, err := loadCfg(tc.rawConf)
+		if err != nil {
+			t.Error(err)
+		}
+		if !reflect.DeepEqual(ac, tc.expected) {
+			t.Errorf("got %v but wanted %v", ac, tc.expected)
+		}
 	}
 }

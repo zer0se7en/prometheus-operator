@@ -873,6 +873,7 @@ RemoteReadSpec defines the remote_read configuration for prometheus.
 | name | The name of the remote read queue, must be unique if specified. The name is used in metrics and logging in order to differentiate read configurations.  Only valid in Prometheus versions 2.15.0 and newer. | string | false |
 | requiredMatchers | An optional list of equality matchers which have to be present in a selector to query the remote read endpoint. | map[string]string | false |
 | remoteTimeout | Timeout for requests to the remote read endpoint. | string | false |
+| headers | Custom HTTP headers to be sent along with each remote read request. Be aware that headers that are set by Prometheus itself can't be overwritten. Only valid in Prometheus versions 2.26.0 and newer. | map[string]string | false |
 | readRecent | Whether reads should be made for queries for time ranges that the local storage should have complete data for. | bool | false |
 | basicAuth | BasicAuth for the URL. | *[BasicAuth](#basicauth) | false |
 | oauth2 | OAuth2 for the URL. Only valid in Prometheus versions 2.27.0 and newer. | *[OAuth2](#oauth2) | false |
@@ -932,7 +933,7 @@ Rule describes an alerting or recording rule See Prometheus documentation: [aler
 
 ## RuleGroup
 
-RuleGroup is a list of sequentially evaluated recording and alerting rules. Note: PartialResponseStrategy is only used by ThanosRuler and will be ignored by Prometheus instances.  Valid values for this field are 'warn' or 'abort'.  More info: https://github.com/thanos-io/thanos/blob/master/docs/components/rule.md#partial-response
+RuleGroup is a list of sequentially evaluated recording and alerting rules. Note: PartialResponseStrategy is only used by ThanosRuler and will be ignored by Prometheus instances.  Valid values for this field are 'warn' or 'abort'.  More info: https://github.com/thanos-io/thanos/blob/main/docs/components/rule.md#partial-response
 
 
 <em>appears in: [PrometheusRuleSpec](#prometheusrulespec)</em>
@@ -1086,7 +1087,7 @@ Sigv4 optionally configures AWS's Signature Verification 4 signing process to si
 
 ## StorageSpec
 
-StorageSpec defines the configured storage for a group Prometheus servers. If neither `emptyDir` nor `volumeClaimTemplate` is specified, then by default an [EmptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir) will be used.
+StorageSpec defines the configured storage for a group Prometheus servers. If no storage option is specified, then by default an [EmptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir) will be used. If multiple storage options are specified, priority will be given as follows: EmptyDir, Ephemeral, and lastly VolumeClaimTemplate.
 
 
 <em>appears in: [AlertmanagerSpec](#alertmanagerspec), [PrometheusSpec](#prometheusspec), [ThanosRulerSpec](#thanosrulerspec)</em>
@@ -1095,6 +1096,7 @@ StorageSpec defines the configured storage for a group Prometheus servers. If ne
 | ----- | ----------- | ------ | -------- |
 | disableMountSubPath | Deprecated: subPath usage will be disabled by default in a future release, this option will become unnecessary. DisableMountSubPath allows to remove any subPath usage in volume mounts. | bool | false |
 | emptyDir | EmptyDirVolumeSource to be used by the Prometheus StatefulSets. If specified, used in place of any volumeClaimTemplate. More info: https://kubernetes.io/docs/concepts/storage/volumes/#emptydir | *[v1.EmptyDirVolumeSource](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#emptydirvolumesource-v1-core) | false |
+| ephemeral | EphemeralVolumeSource to be used by the Prometheus StatefulSets. This is a beta field in k8s 1.21, for lower versions, starting with k8s 1.19, it requires enabling the GenericEphemeralVolume feature gate. More info: https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#generic-ephemeral-volumes | *v1.EphemeralVolumeSource | false |
 | volumeClaimTemplate | A PVC spec to be used by the Prometheus StatefulSets. | [EmbeddedPersistentVolumeClaim](#embeddedpersistentvolumeclaim) | false |
 
 [Back to TOC](#table-of-contents)
@@ -1404,7 +1406,8 @@ Matcher defines how to match on alert's labels.
 | ----- | ----------- | ------ | -------- |
 | name | Label to match. | string | true |
 | value | Label value to match. | string | true |
-| regex | Whether to match on equality (false) or regular-expression (true). | bool | false |
+| matchType | Match operation available with AlertManager >= v0.22.0 and takes precedence over Regex (deprecated) if non-empty. | MatchType | false |
+| regex | Whether to match on equality (false) or regular-expression (true). Deprecated as of AlertManager >= v0.22.0 where a user should use MatchType instead. | bool | false |
 
 [Back to TOC](#table-of-contents)
 

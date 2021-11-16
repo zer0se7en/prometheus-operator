@@ -468,7 +468,8 @@ type AlertingSpec struct {
 }
 
 // StorageSpec defines the configured storage for a group Prometheus servers.
-// If neither `emptyDir` nor `volumeClaimTemplate` is specified, then by default an [EmptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir) will be used.
+// If no storage option is specified, then by default an [EmptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir) will be used.
+// If multiple storage options are specified, priority will be given as follows: EmptyDir, Ephemeral, and lastly VolumeClaimTemplate.
 // +k8s:openapi-gen=true
 type StorageSpec struct {
 	// Deprecated: subPath usage will be disabled by default in a future release, this option will become unnecessary.
@@ -477,6 +478,10 @@ type StorageSpec struct {
 	// EmptyDirVolumeSource to be used by the Prometheus StatefulSets. If specified, used in place of any volumeClaimTemplate. More
 	// info: https://kubernetes.io/docs/concepts/storage/volumes/#emptydir
 	EmptyDir *v1.EmptyDirVolumeSource `json:"emptyDir,omitempty"`
+	// EphemeralVolumeSource to be used by the Prometheus StatefulSets.
+	// This is a beta field in k8s 1.21, for lower versions, starting with k8s 1.19, it requires enabling the GenericEphemeralVolume feature gate.
+	// More info: https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#generic-ephemeral-volumes
+	Ephemeral *v1.EphemeralVolumeSource `json:"ephemeral,omitempty"`
 	// A PVC spec to be used by the Prometheus StatefulSets.
 	VolumeClaimTemplate EmbeddedPersistentVolumeClaim `json:"volumeClaimTemplate,omitempty"`
 }
@@ -770,6 +775,10 @@ type RemoteReadSpec struct {
 	RequiredMatchers map[string]string `json:"requiredMatchers,omitempty"`
 	// Timeout for requests to the remote read endpoint.
 	RemoteTimeout string `json:"remoteTimeout,omitempty"`
+	// Custom HTTP headers to be sent along with each remote read request.
+	// Be aware that headers that are set by Prometheus itself can't be overwritten.
+	// Only valid in Prometheus versions 2.26.0 and newer.
+	Headers map[string]string `json:"headers,omitempty"`
 	// Whether reads should be made for queries for time ranges that
 	// the local storage should have complete data for.
 	ReadRecent bool `json:"readRecent,omitempty"`
@@ -1405,7 +1414,7 @@ type PrometheusRuleSpec struct {
 // RuleGroup is a list of sequentially evaluated recording and alerting rules.
 // Note: PartialResponseStrategy is only used by ThanosRuler and will
 // be ignored by Prometheus instances.  Valid values for this field are 'warn'
-// or 'abort'.  More info: https://github.com/thanos-io/thanos/blob/master/docs/components/rule.md#partial-response
+// or 'abort'.  More info: https://github.com/thanos-io/thanos/blob/main/docs/components/rule.md#partial-response
 // +k8s:openapi-gen=true
 type RuleGroup struct {
 	Name                    string `json:"name"`

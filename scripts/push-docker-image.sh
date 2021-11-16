@@ -16,7 +16,7 @@ set -e
 # only exit with zero if all commands of the pipeline exit successfully
 set -o pipefail
 
-CPU_ARCHS="amd64 arm64 arm ppc64le"
+CPU_ARCHS="amd64 arm64 arm ppc64le s390x"
 REGISTRIES="${REGISTRIES:-"quay.io ghcr.io"}"
 
 # IMAGE_OPERATOR and IMAGER_RELOADER need to be exported to be used by `make`
@@ -29,10 +29,10 @@ export TAG="${GITHUB_REF##*/}"
 # Push `-dev` images unless commit is tagged
 IMAGE_SUFFIX="-dev"
 
-# Use the main image repository if TAG is a semver tag or it is a master branch.
+# Use the main image repository if TAG is a semver tag or it is a main or master branch.
 # Otherwise assemble the image tag from VERSION file + short commit SHA and
 # push them to the dev image repository.
-if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+ ]] || [ "${TAG}" == "master" ]; then
+if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+ ]] || [ "${TAG}" == "master" ] || [ "${TAG}" == "main" ]; then
 	# Reset suffixes as images are not development ones
 	IMAGE_SUFFIX=""
 else
@@ -77,7 +77,8 @@ for r in ${OPERATORS} ${RELOADERS}; do
 				  "${r}:${TAG}-amd64" \
 				  "${r}:${TAG}-arm64" \
 				  "${r}:${TAG}-arm" \
-				  "${r}:${TAG}-ppc64le"
+				  "${r}:${TAG}-ppc64le" \
+				  "${r}:${TAG}-s390x"
 
 	# Annotate to set which image is build for which CPU architecture
 	for arch in $CPU_ARCHS; do

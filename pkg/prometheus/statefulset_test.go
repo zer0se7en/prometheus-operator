@@ -71,7 +71,6 @@ func TestStatefulSetLabelingAndAnnotations(t *testing.T) {
 
 	expectedPodLabels := map[string]string{
 		"prometheus":                   "",
-		"app":                          "prometheus",
 		"app.kubernetes.io/name":       "prometheus",
 		"app.kubernetes.io/version":    strings.TrimPrefix(operator.DefaultPrometheusVersion, "v"),
 		"app.kubernetes.io/managed-by": "prometheus-operator",
@@ -215,8 +214,47 @@ func TestStatefulSetEmptyDir(t *testing.T) {
 
 	require.NoError(t, err)
 	ssetVolumes := sset.Spec.Template.Spec.Volumes
-	if ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir != nil && !reflect.DeepEqual(emptyDir.Medium, ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir.Medium) {
+	if ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir == nil || !reflect.DeepEqual(emptyDir.Medium, ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir.Medium) {
 		t.Fatal("Error adding EmptyDir Spec to StatefulSetSpec")
+	}
+}
+
+func TestStatefulSetEphemeral(t *testing.T) {
+	labels := map[string]string{
+		"testlabel": "testlabelvalue",
+	}
+	annotations := map[string]string{
+		"testannotation": "testannotationvalue",
+	}
+
+	storageClass := "storageclass"
+
+	ephemeral := v1.EphemeralVolumeSource{
+		VolumeClaimTemplate: &v1.PersistentVolumeClaimTemplate{
+			Spec: v1.PersistentVolumeClaimSpec{
+				AccessModes:      []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+				StorageClassName: &storageClass,
+			},
+		},
+	}
+
+	sset, err := makeStatefulSet("test", monitoringv1.Prometheus{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:      labels,
+			Annotations: annotations,
+		},
+		Spec: monitoringv1.PrometheusSpec{
+			Storage: &monitoringv1.StorageSpec{
+				Ephemeral: &ephemeral,
+			},
+		},
+	}, defaultTestConfig, nil, "", 0)
+
+	require.NoError(t, err)
+	ssetVolumes := sset.Spec.Template.Spec.Volumes
+	if ssetVolumes[len(ssetVolumes)-1].VolumeSource.Ephemeral == nil ||
+		!reflect.DeepEqual(ephemeral.VolumeClaimTemplate.Spec.StorageClassName, ssetVolumes[len(ssetVolumes)-1].VolumeSource.Ephemeral.VolumeClaimTemplate.Spec.StorageClassName) {
+		t.Fatal("Error adding Ephemeral Spec to StatefulSetSpec")
 	}
 }
 
@@ -406,20 +444,35 @@ func TestListenLocal(t *testing.T) {
 		t.Fatal("Prometheus not listening on loopback when it should.")
 	}
 
-	actualReadinessProbe := sset.Spec.Template.Spec.Containers[0].ReadinessProbe
-	expectedReadinessProbe := &v1.Probe{
-		Handler: v1.Handler{
+	expectedProbeHandler := func(probePath string) v1.Handler {
+		return v1.Handler{
 			Exec: &v1.ExecAction{
 				Command: []string{
 					`sh`,
 					`-c`,
-					`if [ -x "$(command -v curl)" ]; then exec curl http://localhost:9090/-/ready; elif [ -x "$(command -v wget)" ]; then exec wget -q -O /dev/null http://localhost:9090/-/ready; else exit 1; fi`,
+					fmt.Sprintf(`if [ -x "$(command -v curl)" ]; then exec curl %[1]s; elif [ -x "$(command -v wget)" ]; then exec wget -q -O /dev/null %[1]s; else exit 1; fi`, fmt.Sprintf("http://localhost:9090%s", probePath)),
 				},
 			},
-		},
+		}
+	}
+
+	actualStartupProbe := sset.Spec.Template.Spec.Containers[0].StartupProbe
+	expectedStartupProbe := &v1.Probe{
+		Handler:          expectedProbeHandler("/-/healthy"),
+		TimeoutSeconds:   3,
+		PeriodSeconds:    15,
+		FailureThreshold: 60,
+	}
+	if !reflect.DeepEqual(actualStartupProbe, expectedStartupProbe) {
+		t.Fatalf("Startup probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedStartupProbe, actualStartupProbe)
+	}
+
+	actualReadinessProbe := sset.Spec.Template.Spec.Containers[0].ReadinessProbe
+	expectedReadinessProbe := &v1.Probe{
+		Handler:          expectedProbeHandler("/-/ready"),
 		TimeoutSeconds:   3,
 		PeriodSeconds:    5,
-		FailureThreshold: 120,
+		FailureThreshold: 3,
 	}
 	if !reflect.DeepEqual(actualReadinessProbe, expectedReadinessProbe) {
 		t.Fatalf("Readiness probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedReadinessProbe, actualReadinessProbe)
@@ -456,18 +509,33 @@ func TestListenTLS(t *testing.T) {
 		t.Fatalf("Unexpected error while making StatefulSet: %v", err)
 	}
 
-	actualReadinessProbe := sset.Spec.Template.Spec.Containers[0].ReadinessProbe
-	expectedReadinessProbe := &v1.Probe{
-		Handler: v1.Handler{
+	expectedProbeHandler := func(probePath string) v1.Handler {
+		return v1.Handler{
 			HTTPGet: &v1.HTTPGetAction{
-				Path:   "/-/ready",
+				Path:   probePath,
 				Port:   intstr.FromString("web"),
 				Scheme: "HTTPS",
 			},
-		},
+		}
+	}
+
+	actualStartupProbe := sset.Spec.Template.Spec.Containers[0].StartupProbe
+	expectedStartupProbe := &v1.Probe{
+		Handler:          expectedProbeHandler("/-/healthy"),
+		TimeoutSeconds:   3,
+		PeriodSeconds:    15,
+		FailureThreshold: 60,
+	}
+	if !reflect.DeepEqual(actualStartupProbe, expectedStartupProbe) {
+		t.Fatalf("Startup probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedStartupProbe, actualStartupProbe)
+	}
+
+	actualReadinessProbe := sset.Spec.Template.Spec.Containers[0].ReadinessProbe
+	expectedReadinessProbe := &v1.Probe{
+		Handler:          expectedProbeHandler("/-/ready"),
 		TimeoutSeconds:   3,
 		PeriodSeconds:    5,
-		FailureThreshold: 120,
+		FailureThreshold: 3,
 	}
 	if !reflect.DeepEqual(actualReadinessProbe, expectedReadinessProbe) {
 		t.Fatalf("Readiness probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedReadinessProbe, actualReadinessProbe)

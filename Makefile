@@ -167,6 +167,8 @@ update-go-deps:
 	for m in $$(go list -mod=readonly -m -f '{{ if and (not .Indirect) (not .Main)}}{{.Path}}{{end}}' all); do \
 		go get $$m; \
 	done
+	(cd pkg/client && go get -u ./...)
+	(cd pkg/apis/monitoring && go get -u ./...)
 	@echo "Don't forget to run 'make tidy'"
 
 ##############
@@ -185,7 +187,10 @@ generate: $(DEEPCOPY_TARGETS) generate-crds bundle.yaml example/mixin/alerts.yam
 
 .PHONY: generate-crds
 generate-crds: $(CONTROLLER_GEN_BINARY) $(GOJSONTOYAML_BINARY) $(TYPES_V1_TARGET) $(TYPES_V1ALPHA1_TARGET)
-	GOOS=$(OS) GOARCH=$(ARCH) go run -v ./scripts/generate-crds.go --controller-gen=$(CONTROLLER_GEN_BINARY) --gojsontoyaml=$(GOJSONTOYAML_BINARY)
+	cd pkg/apis/monitoring/v1 && $(CONTROLLER_GEN_BINARY) crd:crdVersions=v1,preserveUnknownFields=false paths=. output:crd:dir=$(PWD)/example/prometheus-operator-crd
+	cd pkg/apis/monitoring/v1alpha1 && $(CONTROLLER_GEN_BINARY) crd:crdVersions=v1,preserveUnknownFields=false paths=. output:crd:dir=$(PWD)/example/prometheus-operator-crd
+	find example/prometheus-operator-crd/ -name '*.yaml' -print0 | xargs -0 -I{} sh -c '$(GOJSONTOYAML_BINARY) -yamltojson < "$$1" | jq > "$(PWD)/jsonnet/prometheus-operator/$$(basename $$1 | cut -d'_' -f2 | cut -d. -f1)-crd.json"' -- {}
+
 
 .PHONY: generate-remote-write-certs
 generate-remote-write-certs:

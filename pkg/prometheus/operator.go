@@ -24,21 +24,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/prometheus-operator/prometheus-operator/pkg/webconfig"
-
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	"github.com/prometheus-operator/prometheus-operator/pkg/assets"
-	monitoringclient "github.com/prometheus-operator/prometheus-operator/pkg/client/versioned"
-	"github.com/prometheus-operator/prometheus-operator/pkg/informers"
-	"github.com/prometheus-operator/prometheus-operator/pkg/k8sutil"
-	"github.com/prometheus-operator/prometheus-operator/pkg/listwatch"
-	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
-
+	"github.com/asaskevich/govalidator"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/mitchellh/hashstructure"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/relabel"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -50,6 +43,15 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"github.com/prometheus-operator/prometheus-operator/pkg/assets"
+	monitoringclient "github.com/prometheus-operator/prometheus-operator/pkg/client/versioned"
+	"github.com/prometheus-operator/prometheus-operator/pkg/informers"
+	"github.com/prometheus-operator/prometheus-operator/pkg/k8sutil"
+	"github.com/prometheus-operator/prometheus-operator/pkg/listwatch"
+	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
+	"github.com/prometheus-operator/prometheus-operator/pkg/webconfig"
 )
 
 const (
@@ -88,8 +90,6 @@ type Operator struct {
 	kubeletObjectNamespace string
 	kubeletSyncEnabled     bool
 	config                 operator.Config
-
-	configGenerator *ConfigGenerator
 }
 
 // New creates a new controller.
@@ -142,7 +142,6 @@ func New(ctx context.Context, conf operator.Config, logger log.Logger, r prometh
 		kubeletObjectNamespace: kubeletObjectNamespace,
 		kubeletSyncEnabled:     kubeletSyncEnabled,
 		config:                 conf,
-		configGenerator:        NewConfigGenerator(logger),
 		metrics:                operator.NewMetrics("prometheus", r),
 		nodeAddressLookupErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "prometheus_operator_node_address_lookup_errors_total",
@@ -1213,11 +1212,12 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 	p.APIVersion = monitoringv1.SchemeGroupVersion.String()
 	p.Kind = monitoringv1.PrometheusesKind
 
+	logger := log.With(c.logger, "key", key)
 	if p.Spec.Paused {
+		level.Info(logger).Log("msg", "the resource is paused, not reconciling")
 		return nil
 	}
 
-	logger := log.With(c.logger, "key", key)
 	level.Info(logger).Log("msg", "sync prometheus")
 	ruleConfigMapNames, err := c.createOrUpdateRuleConfigMaps(ctx, p)
 	if err != nil {
@@ -1230,7 +1230,8 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 		return errors.Wrap(err, "creating config failed")
 	}
 
-	if err := c.createOrUpdateTLSAssetSecret(ctx, p, assetStore); err != nil {
+	tlsAssets, err := c.createOrUpdateTLSAssetSecrets(ctx, p, assetStore)
+	if err != nil {
 		return errors.Wrap(err, "creating tls asset secret failed")
 	}
 
@@ -1258,17 +1259,29 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 			return errors.Wrap(err, "retrieving statefulset failed")
 		}
 
-		spec := appsv1.StatefulSetSpec{}
+		existingStatefulSet := &appsv1.StatefulSet{}
 		if obj != nil {
-			ss := obj.(*appsv1.StatefulSet)
-			spec = ss.Spec
+			existingStatefulSet = obj.(*appsv1.StatefulSet)
+			if existingStatefulSet.DeletionTimestamp != nil {
+				// We want to avoid entering a hot-loop of update/delete cycles here since the sts was
+				// marked for deletion in foreground, which means it may take some time before the finalizers complete and
+				// the resource disappears from the API. The deletion timestamp will have been set when the initial
+				// delete request was issued. In that case, we avoid further processing.
+				level.Info(logger).Log(
+					"msg", "halting update of StatefulSet",
+					"reason", "resource has been marked for deletion",
+					"resource_name", existingStatefulSet.GetName(),
+				)
+				return nil
+			}
 		}
-		newSSetInputHash, err := createSSetInputHash(*p, c.config, ruleConfigMapNames, spec)
+
+		newSSetInputHash, err := createSSetInputHash(*p, c.config, ruleConfigMapNames, tlsAssets, existingStatefulSet.Spec)
 		if err != nil {
 			return err
 		}
 
-		sset, err := makeStatefulSet(ssetName, *p, &c.config, ruleConfigMapNames, newSSetInputHash, int32(shard))
+		sset, err := makeStatefulSet(ssetName, *p, &c.config, ruleConfigMapNames, newSSetInputHash, int32(shard), tlsAssets.ShardNames())
 		if err != nil {
 			return errors.Wrap(err, "making statefulset failed")
 		}
@@ -1283,8 +1296,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 			return nil
 		}
 
-		oldSSetInputHash := obj.(*appsv1.StatefulSet).ObjectMeta.Annotations[sSetInputHashName]
-		if newSSetInputHash == oldSSetInputHash {
+		if newSSetInputHash == existingStatefulSet.ObjectMeta.Annotations[sSetInputHashName] {
 			level.Debug(logger).Log("msg", "new statefulset generation inputs match current, skipping any actions")
 			continue
 		}
@@ -1304,6 +1316,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 			}
 
 			level.Info(logger).Log("msg", "recreating StatefulSet because the update operation wasn't possible", "reason", strings.Join(failMsg, ", "))
+
 			propagationPolicy := metav1.DeletePropagationForeground
 			if err := ssetClient.Delete(ctx, sset.GetName(), metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil {
 				return errors.Wrap(err, "failed to delete StatefulSet to avoid forbidden action")
@@ -1371,13 +1384,14 @@ func checkPrometheusSpecDeprecation(key string, p *monitoringv1.Prometheus, logg
 	}
 }
 
-func createSSetInputHash(p monitoringv1.Prometheus, c operator.Config, ruleConfigMapNames []string, ss interface{}) (string, error) {
+func createSSetInputHash(p monitoringv1.Prometheus, c operator.Config, ruleConfigMapNames []string, tlsAssets *operator.ShardedSecret, ss interface{}) (string, error) {
 	hash, err := hashstructure.Hash(struct {
 		P monitoringv1.Prometheus
 		C operator.Config
 		S interface{}
 		R []string `hash:"set"`
-	}{p, c, ss, ruleConfigMapNames},
+		A []string `hash:"set"`
+	}{p, c, ss, ruleConfigMapNames, tlsAssets.ShardNames()},
 		nil,
 	)
 	if err != nil {
@@ -1599,8 +1613,13 @@ func (c *Operator) createOrUpdateConfigurationSecret(ctx context.Context, p *mon
 		return errors.Wrap(err, "loading additional alert manager configs from Secret failed")
 	}
 
+	cg, err := NewConfigGenerator(c.logger, p)
+	if err != nil {
+		return err
+	}
+
 	// Update secret based on the most recent configuration.
-	conf, err := c.configGenerator.GenerateConfig(
+	conf, err := cg.Generate(
 		p,
 		smons,
 		pmons,
@@ -1631,14 +1650,33 @@ func (c *Operator) createOrUpdateConfigurationSecret(ctx context.Context, p *mon
 	return k8sutil.CreateOrUpdateSecret(ctx, sClient, s)
 }
 
-func (c *Operator) createOrUpdateTLSAssetSecret(ctx context.Context, p *monitoringv1.Prometheus, store *assets.Store) error {
-	boolTrue := true
+func (c *Operator) createOrUpdateTLSAssetSecrets(ctx context.Context, p *monitoringv1.Prometheus, store *assets.Store) (*operator.ShardedSecret, error) {
+	labels := c.config.Labels.Merge(managedByOperatorLabels)
+	template := newTLSAssetSecret(p, labels)
+
+	sSecret := operator.NewShardedSecret(template, tlsAssetsSecretName(p.Name))
+
+	for k, v := range store.TLSAssets {
+		sSecret.AppendData(k.String(), []byte(v))
+	}
+
 	sClient := c.kclient.CoreV1().Secrets(p.Namespace)
 
-	tlsAssetsSecret := &v1.Secret{
+	if err := sSecret.StoreSecrets(ctx, sClient); err != nil {
+		return nil, errors.Wrapf(err, "failed to create TLS assets secret for Prometheus")
+	}
+
+	level.Debug(c.logger).Log("msg", "tls-asset secret: stored")
+
+	return sSecret, nil
+}
+
+func newTLSAssetSecret(p *monitoringv1.Prometheus, labels map[string]string) *v1.Secret {
+	boolTrue := true
+	return &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   tlsAssetsSecretName(p.Name),
-			Labels: c.config.Labels.Merge(managedByOperatorLabels),
+			Labels: labels,
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion:         p.APIVersion,
@@ -1652,17 +1690,6 @@ func (c *Operator) createOrUpdateTLSAssetSecret(ctx context.Context, p *monitori
 		},
 		Data: map[string][]byte{},
 	}
-
-	for key, asset := range store.TLSAssets {
-		tlsAssetsSecret.Data[key.String()] = []byte(asset)
-	}
-
-	err := k8sutil.CreateOrUpdateSecret(ctx, sClient, tlsAssetsSecret)
-	if err != nil {
-		return errors.Wrap(err, "failed to create TLS assets secret for Prometheus")
-	}
-
-	return nil
 }
 
 func (c *Operator) createOrUpdateWebConfigSecret(ctx context.Context, p *monitoringv1.Prometheus) error {
@@ -1783,6 +1810,26 @@ func (c *Operator) selectServiceMonitors(ctx context.Context, p *monitoringv1.Pr
 			if err = store.AddSafeAuthorizationCredentials(ctx, sm.GetNamespace(), endpoint.Authorization, smAuthKey); err != nil {
 				break
 			}
+
+			if err = validateScrapeIntervalAndTimeout(p, endpoint.Interval, endpoint.ScrapeTimeout); err != nil {
+				break
+			}
+
+			for _, rl := range endpoint.RelabelConfigs {
+				if rl.Action != "" {
+					if err = validateRelabelConfig(*rl); err != nil {
+						break
+					}
+				}
+			}
+
+			for _, rl := range endpoint.MetricRelabelConfigs {
+				if rl.Action != "" {
+					if err = validateRelabelConfig(*rl); err != nil {
+						break
+					}
+				}
+			}
 		}
 
 		if err != nil {
@@ -1883,6 +1930,26 @@ func (c *Operator) selectPodMonitors(ctx context.Context, p *monitoringv1.Promet
 			if err = store.AddSafeAuthorizationCredentials(ctx, pm.GetNamespace(), endpoint.Authorization, pmAuthKey); err != nil {
 				break
 			}
+
+			if err = validateScrapeIntervalAndTimeout(p, endpoint.Interval, endpoint.ScrapeTimeout); err != nil {
+				break
+			}
+
+			for _, rl := range endpoint.RelabelConfigs {
+				if rl.Action != "" {
+					if err = validateRelabelConfig(*rl); err != nil {
+						break
+					}
+				}
+			}
+
+			for _, rl := range endpoint.MetricRelabelConfigs {
+				if rl.Action != "" {
+					if err = validateRelabelConfig(*rl); err != nil {
+						break
+					}
+				}
+			}
 		}
 
 		if err != nil {
@@ -1966,10 +2033,12 @@ func (c *Operator) selectProbes(ctx context.Context, p *monitoringv1.Prometheus,
 				"prometheus", p.Name,
 			)
 		}
-		if probe.Spec.Targets.StaticConfig == nil && probe.Spec.Targets.Ingress == nil {
+
+		if err = probe.Spec.Targets.Validate(); err != nil {
 			rejectFn(probe, err)
 			continue
 		}
+
 		pnKey := fmt.Sprintf("probe/%s/%s", probe.GetNamespace(), probe.GetName())
 		if err = store.AddBearerToken(ctx, probe.GetNamespace(), probe.Spec.BearerTokenSecret, pnKey); err != nil {
 			rejectFn(probe, err)
@@ -1998,6 +2067,24 @@ func (c *Operator) selectProbes(ctx context.Context, p *monitoringv1.Prometheus,
 			continue
 		}
 
+		if err = validateScrapeIntervalAndTimeout(p, probe.Spec.Interval, probe.Spec.ScrapeTimeout); err != nil {
+			rejectFn(probe, err)
+			continue
+		}
+
+		for _, rl := range probe.Spec.MetricRelabelConfigs {
+			if rl.Action != "" {
+				if err = validateRelabelConfig(*rl); err != nil {
+					rejectFn(probe, err)
+					continue
+				}
+			}
+		}
+		if err = validateProberURL(probe.Spec.ProberSpec.URL); err != nil {
+			err := errors.Wrapf(err, "%s url specified in proberSpec is invalid, it should be of the format `hostname` or `hostname:port`", probe.Spec.ProberSpec.URL)
+			rejectFn(probe, err)
+			continue
+		}
 		res[probeName] = probe
 	}
 
@@ -2068,4 +2155,64 @@ func validateRemoteWriteSpec(spec monitoringv1.RemoteWriteSpec) error {
 	}
 
 	return nil
+}
+
+func validateRelabelConfig(rc monitoringv1.RelabelConfig) error {
+	relabelTarget := regexp.MustCompile(`^(?:(?:[a-zA-Z_]|\$(?:\{\w+\}|\w+))+\w*)+$`)
+
+	if _, err := relabel.NewRegexp(rc.Regex); err != nil {
+		return errors.Wrapf(err, "invalid regex %s for relabel configuration", rc.Regex)
+	}
+	if rc.Modulus == 0 && rc.Action == string(relabel.HashMod) {
+		return errors.Errorf("relabel configuration for hashmod requires non-zero modulus")
+	}
+	if (rc.Action == string(relabel.Replace) || rc.Action == string(relabel.HashMod)) && rc.TargetLabel == "" {
+		return errors.Errorf("relabel configuration for %s action needs targetLabel value", rc.Action)
+	}
+	if rc.Action == string(relabel.Replace) && !relabelTarget.MatchString(rc.TargetLabel) {
+		return errors.Errorf("%q is invalid 'target_label' for %s action", rc.TargetLabel, rc.Action)
+	}
+	if rc.Action == string(relabel.LabelMap) && !relabelTarget.MatchString(rc.Replacement) {
+		return errors.Errorf("%q is invalid 'replacement' for %s action", rc.Replacement, rc.Action)
+	}
+	if rc.Action == string(relabel.HashMod) && !model.LabelName(rc.TargetLabel).IsValid() {
+		return errors.Errorf("%q is invalid 'target_label' for %s action", rc.TargetLabel, rc.Action)
+	}
+
+	if rc.Action == string(relabel.LabelDrop) || rc.Action == string(relabel.LabelKeep) {
+		if len(rc.SourceLabels) != 0 ||
+			rc.TargetLabel != "" ||
+			rc.Modulus != uint64(0) ||
+			rc.Separator != "" ||
+			rc.Replacement != "" {
+			return errors.Errorf("%s action requires only 'regex', and no other fields", rc.Action)
+		}
+	}
+	return nil
+}
+
+func validateProberURL(url string) error {
+	hostPort := strings.Split(url, ":")
+
+	if !govalidator.IsHost(hostPort[0]) {
+		return errors.Errorf("invalid host: %q", hostPort[0])
+	}
+
+	// handling cases with url specified as host:port
+	if len(hostPort) > 1 {
+		if !govalidator.IsPort(hostPort[1]) {
+			return errors.Errorf("invalid port: %q", hostPort[1])
+		}
+	}
+	return nil
+}
+
+func validateScrapeIntervalAndTimeout(p *monitoringv1.Prometheus, scrapeInterval, scrapeTimeout string) error {
+	if scrapeTimeout == "" {
+		return nil
+	}
+	if scrapeInterval == "" {
+		scrapeInterval = p.Spec.ScrapeInterval
+	}
+	return operator.CompareScrapeTimeoutToScrapeInterval(scrapeTimeout, scrapeInterval)
 }

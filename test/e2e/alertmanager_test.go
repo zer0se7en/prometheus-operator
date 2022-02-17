@@ -735,7 +735,7 @@ func testAlertmanagerConfigCRD(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// reuse the secret for pagerduty and wechat
+	// reuse the secret for pagerduty, wechat and sns
 	testingSecret := "testing-secret"
 	testingSecretKey := "testing-secret-key"
 	testingKeySecret := &v1.Secret{
@@ -886,6 +886,26 @@ func testAlertmanagerConfigCRD(t *testing.T) {
 						Key: testingSecretKey,
 					},
 				}},
+				SNSConfigs: []monitoringv1alpha1.SNSConfig{
+					{
+						ApiURL: "https://sns.us-east-2.amazonaws.com",
+						Sigv4: &monitoringv1.Sigv4{
+							Region: "us-east-2",
+							AccessKey: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: testingSecret,
+								},
+								Key: testingSecretKey,
+							},
+							SecretKey: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: testingSecret,
+								},
+								Key: testingSecretKey,
+							},
+						},
+						TopicARN: "test-topicARN",
+					}},
 			}},
 		},
 	}
@@ -894,7 +914,7 @@ func testAlertmanagerConfigCRD(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Another AlertmanagerConfig object with nested routes.
+	// Another AlertmanagerConfig object with nested routes and mute time intervals.
 	configCR = &monitoringv1alpha1.AlertmanagerConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "e2e-test-amconfig-sub-routes",
@@ -928,6 +948,7 @@ func testAlertmanagerConfigCRD(t *testing.T) {
     },
     {
       "receiver": "e2e",
+      "muteTimeIntervals": ["test"],
       "matchers": [
         {
           "name": "severity",
@@ -949,6 +970,37 @@ func testAlertmanagerConfigCRD(t *testing.T) {
 					}("http://test.url"),
 				}},
 			}},
+			MuteTimeIntervals: []monitoringv1alpha1.MuteTimeInterval{
+				{
+					Name: "test",
+					TimeIntervals: []monitoringv1alpha1.TimeInterval{
+						{
+							Times: []monitoringv1alpha1.TimeRange{
+								{
+									StartTime: "08:00",
+									EndTime:   "17:00",
+								},
+							},
+							Weekdays: []monitoringv1alpha1.WeekdayRange{
+								"Saturday",
+								"Sunday",
+							},
+							Months: []monitoringv1alpha1.MonthRange{
+								"January:March",
+							},
+							DaysOfMonth: []monitoringv1alpha1.DayOfMonthRange{
+								{
+									Start: 1,
+									End:   10,
+								},
+							},
+							Years: []monitoringv1alpha1.YearRange{
+								"2030:2050",
+							},
+						},
+					},
+				},
+			},
 		},
 	}
 
@@ -982,6 +1034,36 @@ func testAlertmanagerConfigCRD(t *testing.T) {
 	}
 
 	if _, err := framework.MonClientV1alpha1.AlertmanagerConfigs(configNs).Create(context.Background(), configCR, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// An AlertmanagerConfig resource that references a missing mute time interval,
+	// it should be rejected by the webhook.
+	configCR = &monitoringv1alpha1.AlertmanagerConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "e2e-test-amconfig",
+		},
+		Spec: monitoringv1alpha1.AlertmanagerConfigSpec{
+			Route: &monitoringv1alpha1.Route{
+				Receiver:          "e2e",
+				Matchers:          []monitoringv1alpha1.Matcher{},
+				MuteTimeIntervals: []string{"na"},
+			},
+			Receivers: []monitoringv1alpha1.Receiver{{
+				Name: "e2e",
+				PagerDutyConfigs: []monitoringv1alpha1.PagerDutyConfig{{
+					RoutingKey: &v1.SecretKeySelector{
+						LocalObjectReference: v1.LocalObjectReference{
+							Name: testingSecret,
+						},
+						Key: testingSecretKey,
+					},
+				}},
+			}},
+		},
+	}
+
+	if _, err := framework.MonClientV1alpha1.AlertmanagerConfigs(configNs).Create(context.Background(), configCR, metav1.CreateOptions{}); err == nil {
 		t.Fatal(err)
 	}
 
@@ -1064,6 +1146,8 @@ route:
       - receiver: %s-e2e-test-amconfig-sub-routes-e2e
         match_re:
           severity: critical|warning
+        mute_time_intervals:
+        - %s-e2e-test-amconfig-sub-routes-test
   - receiver: "null"
     match:
       alertname: DeadMansSwitch
@@ -1107,11 +1191,28 @@ receivers:
   victorops_configs:
   - api_key: 1234abc
     routing_key: abc
+  sns_configs:
+  - api_url: https://sns.us-east-2.amazonaws.com
+    sigv4:
+      region: us-east-2
+      access_key: 1234abc
+      secret_key: 1234abc
+    topic_arn: test-topicARN
 - name: %s-e2e-test-amconfig-sub-routes-e2e
   webhook_configs:
   - url: http://test.url
+mute_time_intervals:
+- name: %s-e2e-test-amconfig-sub-routes-test
+  time_intervals:
+  - times:
+    - start_time: "08:00"
+      end_time: "17:00"
+    weekdays: [saturday, sunday]
+    days_of_month: ["1:10"]
+    months: ["1:3"]
+    years: ['2030:2050']
 templates: []
-`, configNs, configNs, configNs, configNs, configNs, configNs, configNs, configNs, configNs)
+`, configNs, configNs, configNs, configNs, configNs, configNs, configNs, configNs, configNs, configNs, configNs)
 
 		if diff := cmp.Diff(string(cfgSecret.Data["alertmanager.yaml"]), expected); diff != "" {
 			lastErr = errors.Errorf("got(-), want(+):\n%s", diff)

@@ -98,6 +98,7 @@ func makeStatefulSet(
 	ruleConfigMapNames []string,
 	inputHash string,
 	shard int32,
+	tlsAssetSecrets []string,
 ) (*appsv1.StatefulSet, error) {
 	// p is passed in by value, not by reference. But p contains references like
 	// to annotation map, that do not get copied on function invocation. Ensure to
@@ -144,7 +145,7 @@ func makeStatefulSet(
 		}
 	}
 
-	spec, err := makeStatefulSetSpec(p, config, shard, ruleConfigMapNames, parsedVersion)
+	spec, err := makeStatefulSetSpec(p, config, shard, ruleConfigMapNames, tlsAssetSecrets, parsedVersion)
 	if err != nil {
 		return nil, errors.Wrap(err, "make StatefulSet spec")
 	}
@@ -321,7 +322,7 @@ func makeStatefulSetService(p *monitoringv1.Prometheus, config operator.Config) 
 }
 
 func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard int32, ruleConfigMapNames []string,
-	version semver.Version) (*appsv1.StatefulSetSpec, error) {
+	tlsAssetSecrets []string, version semver.Version) (*appsv1.StatefulSetSpec, error) {
 	// Prometheus may take quite long to shut down to checkpoint existing data.
 	// Allow up to 10 minutes for clean termination.
 	terminationGracePeriod := int64(600)
@@ -466,6 +467,23 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard in
 		promArgs[i] = "-" + a
 	}
 
+	assetsVolume := v1.Volume{
+		Name: "tls-assets",
+		VolumeSource: v1.VolumeSource{
+			Projected: &v1.ProjectedVolumeSource{
+				Sources: []v1.VolumeProjection{},
+			},
+		},
+	}
+	for _, assetShard := range tlsAssetSecrets {
+		assetsVolume.Projected.Sources = append(assetsVolume.Projected.Sources,
+			v1.VolumeProjection{
+				Secret: &v1.SecretProjection{
+					LocalObjectReference: v1.LocalObjectReference{Name: assetShard},
+				},
+			})
+	}
+
 	volumes := []v1.Volume{
 		{
 			Name: "config",
@@ -475,14 +493,7 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard in
 				},
 			},
 		},
-		{
-			Name: "tls-assets",
-			VolumeSource: v1.VolumeSource{
-				Secret: &v1.SecretVolumeSource{
-					SecretName: tlsAssetsSecretName(p.Name),
-				},
-			},
-		},
+		assetsVolume,
 		{
 			Name: "config-out",
 			VolumeSource: v1.VolumeSource{
@@ -594,9 +605,9 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard in
 		})
 	}
 
-	probeHandler := func(probePath string) v1.Handler {
+	probeHandler := func(probePath string) v1.ProbeHandler {
 		probePath = path.Clean(webRoutePrefix + probePath)
-		handler := v1.Handler{}
+		handler := v1.ProbeHandler{}
 		if p.Spec.ListenLocal {
 			handler.Exec = &v1.ExecAction{
 				Command: []string{
@@ -617,17 +628,29 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard in
 		return handler
 	}
 
+	// The /-/ready handler returns OK only after the TSDB initialization has
+	// completed. The WAL replay can take a significant time for large setups
+	// hence we enable the startup probe with a generous failure threshold (15
+	// minutes) to ensure that the readiness probe only comes into effect once
+	// Prometheus is effectively ready.
+	// We don't want to use the /-/healthy handler here because it returns OK as
+	// soon as the web server is started (irrespective of the WAL replay).
 	startupProbe := &v1.Probe{
-		Handler:          probeHandler("/-/healthy"),
+		ProbeHandler:     probeHandler("/-/ready"),
 		TimeoutSeconds:   probeTimeoutSeconds,
 		PeriodSeconds:    15,
 		FailureThreshold: 60,
 	}
 
-	// TODO(paulfantom): Re-add livenessProbe when kubernetes 1.21 is available.
-	// This would be a follow-up to https://github.com/prometheus-operator/prometheus-operator/pull/3502
+	livenessProbe := &v1.Probe{
+		ProbeHandler:     probeHandler("/-/healthy"),
+		TimeoutSeconds:   probeTimeoutSeconds,
+		PeriodSeconds:    5,
+		FailureThreshold: 6,
+	}
+
 	readinessProbe := &v1.Probe{
-		Handler:          probeHandler("/-/ready"),
+		ProbeHandler:     probeHandler("/-/ready"),
 		TimeoutSeconds:   probeTimeoutSeconds,
 		PeriodSeconds:    5,
 		FailureThreshold: 3,
@@ -637,6 +660,10 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard in
 	podLabels := map[string]string{
 		"app.kubernetes.io/version": version.String(),
 	}
+	// In cases where an existing selector label is modified, or a new one is added, new sts cannot match existing pods.
+	// We should try to avoid removing such immutable fields whenever possible since doing
+	// so forces us to enter the 'recreate cycle' and can potentially lead to downtime.
+	// The requirement to make a change here should be carefully evaluated.
 	podSelectorLabels := map[string]string{
 		"app.kubernetes.io/name":       "prometheus",
 		"app.kubernetes.io/managed-by": "prometheus-operator",
@@ -710,11 +737,20 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard in
 			}
 		}
 
+		boolFalse := false
+		boolTrue := true
 		container := v1.Container{
 			Name:                     "thanos-sidecar",
 			Image:                    thanosImage,
 			TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
 			Args:                     thanosArgs,
+			SecurityContext: &v1.SecurityContext{
+				AllowPrivilegeEscalation: &boolFalse,
+				ReadOnlyRootFilesystem:   &boolTrue,
+				Capabilities: &v1.Capabilities{
+					Drop: []v1.Capability{"ALL"},
+				},
+			},
 			Ports: []v1.ContainerPort{
 				{
 					Name:          "http",
@@ -849,6 +885,7 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard in
 		return nil, errors.Wrap(err, "failed to merge init containers spec")
 	}
 
+	boolFalse := false
 	operatorContainers := append([]v1.Container{
 		{
 			Name:                     "prometheus",
@@ -857,9 +894,18 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard in
 			Args:                     promArgs,
 			VolumeMounts:             promVolumeMounts,
 			StartupProbe:             startupProbe,
+			LivenessProbe:            livenessProbe,
 			ReadinessProbe:           readinessProbe,
 			Resources:                p.Spec.Resources,
 			TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
+			SecurityContext: &v1.SecurityContext{
+				// Although we want to include ReadOnlyRootFilesystem, it will break users of QueryLog
+				// See also: https://github.com/prometheus-operator/prometheus-operator/issues/4562
+				AllowPrivilegeEscalation: &boolFalse,
+				Capabilities: &v1.Capabilities{
+					Drop: []v1.Capability{"ALL"},
+				},
+			},
 		},
 		operator.CreateConfigReloader(
 			"config-reloader",
@@ -884,6 +930,8 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard in
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to merge containers spec")
 	}
+
+	boolTrue := true
 	// PodManagementPolicy is set to Parallel to mitigate issues in kubernetes: https://github.com/kubernetes/kubernetes/issues/60164
 	// This is also mentioned as one of limitations of StatefulSets: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#limitations
 	return &appsv1.StatefulSetSpec{
@@ -907,6 +955,7 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *operator.Config, shard in
 				InitContainers:                initContainers,
 				SecurityContext:               p.Spec.SecurityContext,
 				ServiceAccountName:            p.Spec.ServiceAccountName,
+				AutomountServiceAccountToken:  &boolTrue,
 				NodeSelector:                  p.Spec.NodeSelector,
 				PriorityClassName:             p.Spec.PriorityClassName,
 				TerminationGracePeriodSeconds: &terminationGracePeriod,

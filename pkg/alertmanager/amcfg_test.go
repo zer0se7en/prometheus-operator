@@ -25,6 +25,7 @@ import (
 	"github.com/blang/semver/v4"
 	"github.com/go-kit/log"
 	"github.com/google/go-cmp/cmp"
+	monitoringingv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	monitoringv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
 	"github.com/prometheus-operator/prometheus-operator/pkg/assets"
 	"github.com/prometheus/alertmanager/config"
@@ -194,7 +195,7 @@ templates: []
 			baseConfig: alertmanagerConfig{
 				Route:     &route{Receiver: "null"},
 				Receivers: []*receiver{{Name: "null"}},
-				MuteTimeIntervals: []muteTimeInterval{
+				MuteTimeIntervals: []*muteTimeInterval{
 					{
 						Name: "maintenance_windows",
 						TimeIntervals: []timeinterval.TimeInterval{
@@ -255,6 +256,53 @@ templates: []
 `,
 		},
 		{
+			name:    "skeleton base with sns receiver, no CRs",
+			kclient: fake.NewSimpleClientset(),
+			baseConfig: alertmanagerConfig{
+				Route: &route{Receiver: "sns-test"},
+				Receivers: []*receiver{
+					{
+						Name: "sns-test",
+						SNSConfigs: []*snsConfig{
+							{
+								APIUrl:      "https://sns.us-west-2.amazonaws.com",
+								TopicARN:    "arn:test",
+								PhoneNumber: "+12345",
+								TargetARN:   "arn:target",
+								Subject:     "testing",
+								Sigv4: sigV4Config{
+									Region:    "us-west-2",
+									AccessKey: "key",
+									SecretKey: "secret",
+									Profile:   "dev",
+									RoleARN:   "arn:dev",
+								},
+							},
+						},
+					},
+				},
+			},
+			amConfigs: map[string]*monitoringv1alpha1.AlertmanagerConfig{},
+			expected: `route:
+  receiver: sns-test
+receivers:
+- name: sns-test
+  sns_configs:
+  - api_url: https://sns.us-west-2.amazonaws.com
+    sigv4:
+      region: us-west-2
+      access_key: key
+      secret_key: secret
+      profile: dev
+      role_arn: arn:dev
+    topic_arn: arn:test
+    phone_number: "+12345"
+    target_arn: arn:target
+    subject: testing
+templates: []
+`,
+		},
+		{
 			name:    "skeleton base, simple CR",
 			kclient: fake.NewSimpleClientset(),
 			baseConfig: alertmanagerConfig{
@@ -270,6 +318,7 @@ templates: []
 					Spec: monitoringv1alpha1.AlertmanagerConfigSpec{
 						Route: &monitoringv1alpha1.Route{
 							Receiver: "test",
+							GroupBy:  []string{"job"},
 						},
 						Receivers: []monitoringv1alpha1.Receiver{{Name: "test"}},
 					},
@@ -279,6 +328,8 @@ templates: []
   receiver: "null"
   routes:
   - receiver: mynamespace-myamc-test
+    group_by:
+    - job
     matchers:
     - namespace="mynamespace"
     continue: true
@@ -521,6 +572,19 @@ templates: []
 									},
 									Key: "routingKey",
 								},
+								PagerDutyImageConfigs: []monitoringv1alpha1.PagerDutyImageConfig{
+									{
+										Src:  "https://some-image.com",
+										Href: "https://some-image.com",
+										Alt:  "some-image",
+									},
+								},
+								PagerDutyLinkConfigs: []monitoringv1alpha1.PagerDutyLinkConfig{
+									{
+										Href: "https://some-link.com",
+										Text: "some-link",
+									},
+								},
 							}},
 						}},
 					},
@@ -538,12 +602,38 @@ receivers:
 - name: mynamespace-myamc-test-pd
   pagerduty_configs:
   - routing_key: 1234abc
+    images:
+    - src: https://some-image.com
+      alt: some-image
+      href: https://some-image.com
+    links:
+    - href: https://some-link.com
+      text: some-link
 templates: []
 `,
 		},
 		{
-			name:    "CR with Webhook Receiver",
-			kclient: fake.NewSimpleClientset(),
+			name: "CR with Webhook Receiver and custom http config (oauth2)",
+			kclient: fake.NewSimpleClientset(
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "webhook-client-id",
+						Namespace: "mynamespace",
+					},
+					Data: map[string]string{
+						"test": "clientID",
+					},
+				},
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "webhook-client-secret",
+						Namespace: "mynamespace",
+					},
+					Data: map[string][]byte{
+						"test": []byte("clientSecret"),
+					},
+				},
+			),
 			baseConfig: alertmanagerConfig{
 				Route: &route{
 					Receiver: "null",
@@ -566,6 +656,30 @@ templates: []
 								URL: func(s string) *string {
 									return &s
 								}("http://test.url"),
+								HTTPConfig: &monitoringv1alpha1.HTTPConfig{
+									OAuth2: &monitoringingv1.OAuth2{
+										ClientID: monitoringingv1.SecretOrConfigMap{
+											ConfigMap: &corev1.ConfigMapKeySelector{
+												LocalObjectReference: corev1.LocalObjectReference{
+													Name: "webhook-client-id",
+												},
+												Key: "test",
+											},
+										},
+										ClientSecret: corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: "webhook-client-secret",
+											},
+											Key: "test",
+										},
+										TokenURL: "https://test.com",
+										Scopes:   []string{"any"},
+										EndpointParams: map[string]string{
+											"some": "value",
+										},
+									},
+									FollowRedirects: toBoolPtr(true),
+								},
 							}},
 						}},
 					},
@@ -583,6 +697,16 @@ receivers:
 - name: mynamespace-myamc-test
   webhook_configs:
   - url: http://test.url
+    http_config:
+      oauth2:
+        client_id: clientID
+        client_secret: clientSecret
+        scopes:
+        - any
+        token_url: https://test.com
+        endpoint_params:
+          some: value
+      follow_redirects: true
 templates: []
 `,
 		},
@@ -913,6 +1037,199 @@ receivers:
 templates: []
 `,
 		},
+		{
+
+			name: "CR with SNS Receiver",
+			kclient: fake.NewSimpleClientset(
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "am-sns-test",
+						Namespace: "mynamespace",
+					},
+					Data: map[string][]byte{
+						"key":    []byte("xyz"),
+						"secret": []byte("123"),
+					},
+				}),
+			baseConfig: alertmanagerConfig{
+				Route: &route{
+					Receiver: "null",
+				},
+				Receivers: []*receiver{{Name: "null"}},
+			},
+			amConfigs: map[string]*monitoringv1alpha1.AlertmanagerConfig{
+				"mynamespace": {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "myamc",
+						Namespace: "mynamespace",
+					},
+					Spec: monitoringv1alpha1.AlertmanagerConfigSpec{
+						Route: &monitoringv1alpha1.Route{
+							Receiver: "test",
+						},
+						Receivers: []monitoringv1alpha1.Receiver{{
+							Name: "test",
+							SNSConfigs: []monitoringv1alpha1.SNSConfig{
+								{
+									ApiURL: "https://sns.us-east-2.amazonaws.com",
+									Sigv4: &monitoringingv1.Sigv4{
+										Region: "us-east-2",
+										AccessKey: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: "am-sns-test",
+											},
+											Key: "key",
+										},
+										SecretKey: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: "am-sns-test",
+											},
+											Key: "secret",
+										},
+									},
+									TopicARN: "test-topicARN",
+								},
+							},
+						}},
+					},
+				},
+			},
+			expected: `route:
+  receiver: "null"
+  routes:
+  - receiver: mynamespace-myamc-test
+    matchers:
+    - namespace="mynamespace"
+    continue: true
+receivers:
+- name: "null"
+- name: mynamespace-myamc-test
+  sns_configs:
+  - api_url: https://sns.us-east-2.amazonaws.com
+    sigv4:
+      region: us-east-2
+      access_key: xyz
+      secret_key: "123"
+    topic_arn: test-topicARN
+templates: []
+`,
+		},
+		{
+
+			name:    "CR with Mute Time Intervals",
+			kclient: fake.NewSimpleClientset(),
+			baseConfig: alertmanagerConfig{
+				Global: &globalConfig{
+					SlackAPIURLFile: "/etc/test",
+				},
+				Route: &route{
+					Receiver: "null",
+				},
+				Receivers: []*receiver{{Name: "null"}},
+			},
+			amConfigs: map[string]*monitoringv1alpha1.AlertmanagerConfig{
+				"mynamespace": {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "myamc",
+						Namespace: "mynamespace",
+					},
+					Spec: monitoringv1alpha1.AlertmanagerConfigSpec{
+						Route: &monitoringv1alpha1.Route{
+							Receiver:          "test",
+							MuteTimeIntervals: []string{"test"},
+						},
+						MuteTimeIntervals: []monitoringv1alpha1.MuteTimeInterval{
+							{
+								Name: "test",
+								TimeIntervals: []monitoringv1alpha1.TimeInterval{
+									{
+										Times: []monitoringv1alpha1.TimeRange{
+											{
+												StartTime: "08:00",
+												EndTime:   "17:00",
+											},
+										},
+										Weekdays: []monitoringv1alpha1.WeekdayRange{
+											monitoringv1alpha1.WeekdayRange("Saturday"),
+											monitoringv1alpha1.WeekdayRange("Sunday"),
+										},
+										Months: []monitoringv1alpha1.MonthRange{
+											"January:March",
+										},
+										DaysOfMonth: []monitoringv1alpha1.DayOfMonthRange{
+											{
+												Start: 1,
+												End:   10,
+											},
+										},
+										Years: []monitoringv1alpha1.YearRange{
+											"2030:2050",
+										},
+									},
+								},
+							},
+						},
+						Receivers: []monitoringv1alpha1.Receiver{{
+							Name: "test",
+							SlackConfigs: []monitoringv1alpha1.SlackConfig{{
+								Actions: []monitoringv1alpha1.SlackAction{
+									{
+										Type: "type",
+										Text: "text",
+										Name: "my-action",
+										ConfirmField: &monitoringv1alpha1.SlackConfirmationField{
+											Text: "text",
+										},
+									},
+								},
+								Fields: []monitoringv1alpha1.SlackField{
+									{
+										Title: "title",
+										Value: "value",
+									},
+								},
+							}},
+						}},
+					},
+				},
+			},
+			expected: `global:
+  slack_api_url_file: /etc/test
+route:
+  receiver: "null"
+  routes:
+  - receiver: mynamespace-myamc-test
+    matchers:
+    - namespace="mynamespace"
+    continue: true
+    mute_time_intervals:
+    - mynamespace-myamc-test
+receivers:
+- name: "null"
+- name: mynamespace-myamc-test
+  slack_configs:
+  - fields:
+    - title: title
+      value: value
+    actions:
+    - type: type
+      text: text
+      name: my-action
+      confirm:
+        text: text
+mute_time_intervals:
+- name: mynamespace-myamc-test
+  time_intervals:
+  - times:
+    - start_time: "08:00"
+      end_time: "17:00"
+    weekdays: [saturday, sunday]
+    days_of_month: ["1:10"]
+    months: ["1:3"]
+    years: ['2030:2050']
+templates: []
+`,
+		},
 	}
 
 	logger := log.NewNopLogger()
@@ -1059,39 +1376,7 @@ func TestSanitizeConfig(t *testing.T) {
 			},
 		},
 		{
-			name:           "Test basicAuth takes precedence over authorization in http config",
-			againstVersion: versionFileURLNotAllowed,
-			in: &alertmanagerConfig{
-				Global: &globalConfig{
-					HTTPConfig: &httpClientConfig{
-						Authorization: &authorization{
-							Type:            "any",
-							Credentials:     "some",
-							CredentialsFile: "/must/drop",
-						},
-						BasicAuth: &basicAuth{
-							Username:     "tester",
-							Password:     "testing",
-							PasswordFile: "/test",
-						},
-					},
-				},
-			},
-			expect: alertmanagerConfig{
-				Global: &globalConfig{
-					HTTPConfig: &httpClientConfig{
-						Authorization: nil,
-						BasicAuth: &basicAuth{
-							Username:     "tester",
-							Password:     "testing",
-							PasswordFile: "/test",
-						},
-					},
-				},
-			},
-		},
-		{
-			name:           "Test authorization is dropped in global http config for unsupported versions",
+			name:           "Test authorization causes error for unsupported versions",
 			againstVersion: versionAuthzNotAllowed,
 			in: &alertmanagerConfig{
 				Global: &globalConfig{
@@ -1104,13 +1389,24 @@ func TestSanitizeConfig(t *testing.T) {
 					},
 				},
 			},
-			expect: alertmanagerConfig{
+			expectErr: true,
+		},
+		{
+			name:           "Test oauth2 causes error for unsupported versions",
+			againstVersion: versionAuthzNotAllowed,
+			in: &alertmanagerConfig{
 				Global: &globalConfig{
 					HTTPConfig: &httpClientConfig{
-						Authorization: nil,
+						OAuth2: &oauth2{
+							ClientID:         "a",
+							ClientSecret:     "b",
+							ClientSecretFile: "c",
+							TokenURL:         "d",
+						},
 					},
 				},
 			},
+			expectErr: true,
 		},
 		{
 			name:           "Test slack config happy path",
@@ -1255,41 +1551,6 @@ func TestSanitizeConfig(t *testing.T) {
 		in             *httpClientConfig
 		expect         httpClientConfig
 	}{
-		{
-			name: "Test authorization is dropped in http config for unsupported versions",
-			in: &httpClientConfig{
-				Authorization: &authorization{
-					Type:            "any",
-					Credentials:     "some",
-					CredentialsFile: "/must/drop",
-				},
-			},
-			againstVersion: versionAuthzNotAllowed,
-			expect:         httpClientConfig{},
-		},
-		{
-			name: "Test authorization is dropped in favour of basicAuth for http config",
-			in: &httpClientConfig{
-				Authorization: &authorization{
-					Type:            "any",
-					Credentials:     "some",
-					CredentialsFile: "/must/drop",
-				},
-				BasicAuth: &basicAuth{
-					Username:     "tester",
-					Password:     "testing",
-					PasswordFile: "/test",
-				},
-			},
-			againstVersion: versionAuthzNotAllowed,
-			expect: httpClientConfig{
-				BasicAuth: &basicAuth{
-					Username:     "tester",
-					Password:     "testing",
-					PasswordFile: "/test",
-				},
-			},
-		},
 		{
 			name: "Test happy path",
 			in: &httpClientConfig{
@@ -1469,7 +1730,7 @@ templates: []
 						Name: "null",
 					},
 				},
-				MuteTimeIntervals: []muteTimeInterval{
+				MuteTimeIntervals: []*muteTimeInterval{
 					{
 						Name: "maintenance_windows",
 						TimeIntervals: []timeinterval.TimeInterval{
@@ -1518,7 +1779,7 @@ templates: []
 	}
 
 	for _, tc := range testCase {
-		ac, err := loadCfg(tc.rawConf)
+		ac, err := alertmanagerConfigFrom(tc.rawConf)
 		if err != nil {
 			t.Error(err)
 		}
@@ -1526,4 +1787,8 @@ templates: []
 			t.Errorf("got %v but wanted %v", ac, tc.expected)
 		}
 	}
+}
+
+func toBoolPtr(in bool) *bool {
+	return &in
 }

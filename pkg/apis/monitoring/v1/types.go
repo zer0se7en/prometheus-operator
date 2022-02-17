@@ -248,9 +248,9 @@ type PrometheusSpec struct {
 	Tolerations []v1.Toleration `json:"tolerations,omitempty"`
 	// If specified, the pod's topology spread constraints.
 	TopologySpreadConstraints []v1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
-	// If specified, the remote_write spec. This is an experimental feature, it may change in any upcoming release in a breaking way.
+	// remoteWrite is the list of remote write configurations.
 	RemoteWrite []RemoteWriteSpec `json:"remoteWrite,omitempty"`
-	// If specified, the remote_read spec. This is an experimental feature, it may change in any upcoming release in a breaking way.
+	// remoteRead is the list of remote read configurations.
 	RemoteRead []RemoteReadSpec `json:"remoteRead,omitempty"`
 	// SecurityContext holds pod-level security attributes and common container settings.
 	// This defaults to the default PodSecurityContext.
@@ -682,16 +682,20 @@ type ThanosSpec struct {
 	VolumeMounts []v1.VolumeMount `json:"volumeMounts,omitempty"`
 }
 
-// RemoteWriteSpec defines the remote_write configuration for prometheus.
+// RemoteWriteSpec defines the configuration to write samples from Prometheus
+// to a remote endpoint.
 // +k8s:openapi-gen=true
 type RemoteWriteSpec struct {
 	// The URL of the endpoint to send samples to.
 	URL string `json:"url"`
-	// The name of the remote write queue, must be unique if specified. The
+	// The name of the remote write queue, it must be unique if specified. The
 	// name is used in metrics and logging in order to differentiate queues.
 	// Only valid in Prometheus versions 2.15.0 and newer.
 	Name string `json:"name,omitempty"`
-	// Enables sending of exemplars over remote write. Note that exemplar-storage itself must be enabled using the enableFeature option for exemplars to be scraped in the first place.  Only valid in Prometheus versions 2.27.0 and newer.
+	// Enables sending of exemplars over remote write. Note that
+	// exemplar-storage itself must be enabled using the enableFeature option
+	// for exemplars to be scraped in the first place.  Only valid in
+	// Prometheus versions 2.27.0 and newer.
 	SendExemplars *bool `json:"sendExemplars,omitempty"`
 	// Timeout for requests to the remote write endpoint.
 	RemoteTimeout string `json:"remoteTimeout,omitempty"`
@@ -715,16 +719,16 @@ type RemoteWriteSpec struct {
 	Sigv4 *Sigv4 `json:"sigv4,omitempty"`
 	// TLS Config to use for remote write.
 	TLSConfig *TLSConfig `json:"tlsConfig,omitempty"`
-	// Optional ProxyURL
+	// Optional ProxyURL.
 	ProxyURL string `json:"proxyUrl,omitempty"`
 	// QueueConfig allows tuning of the remote write queue parameters.
 	QueueConfig *QueueConfig `json:"queueConfig,omitempty"`
-	// MetadataConfig configures the sending of series metadata to remote storage.
+	// MetadataConfig configures the sending of series metadata to the remote storage.
 	MetadataConfig *MetadataConfig `json:"metadataConfig,omitempty"`
 }
 
-// QueueConfig allows the tuning of remote_write queue_config parameters. This object
-// is referenced in the RemoteWriteSpec object.
+// QueueConfig allows the tuning of remote write's queue_config parameters.
+// This object is referenced in the RemoteWriteSpec object.
 // +k8s:openapi-gen=true
 type QueueConfig struct {
 	// Capacity is the number of samples to buffer per shard before we start dropping them.
@@ -743,6 +747,9 @@ type QueueConfig struct {
 	MinBackoff string `json:"minBackoff,omitempty"`
 	// MaxBackoff is the maximum retry delay.
 	MaxBackoff string `json:"maxBackoff,omitempty"`
+	// Retry upon receiving a 429 status code from the remote-write storage.
+	// This is experimental feature and might change in the future.
+	RetryOnRateLimit bool `json:"retryOnRateLimit,omitempty"`
 }
 
 // Sigv4 optionally configures AWS's Signature Verification 4 signing process to
@@ -761,12 +768,13 @@ type Sigv4 struct {
 	RoleArn string `json:"roleArn,omitempty"`
 }
 
-// RemoteReadSpec defines the remote_read configuration for prometheus.
+// RemoteReadSpec defines the configuration for Prometheus to read back samples
+// from a remote endpoint.
 // +k8s:openapi-gen=true
 type RemoteReadSpec struct {
-	// The URL of the endpoint to send samples to.
+	// The URL of the endpoint to query from.
 	URL string `json:"url"`
-	// The name of the remote read queue, must be unique if specified. The name
+	// The name of the remote read queue, it must be unique if specified. The name
 	// is used in metrics and logging in order to differentiate read
 	// configurations.  Only valid in Prometheus versions 2.15.0 and newer.
 	Name string `json:"name,omitempty"`
@@ -794,9 +802,13 @@ type RemoteReadSpec struct {
 	Authorization *Authorization `json:"authorization,omitempty"`
 	// TLS Config to use for remote read.
 	TLSConfig *TLSConfig `json:"tlsConfig,omitempty"`
-	// Optional ProxyURL
+	// Optional ProxyURL.
 	ProxyURL string `json:"proxyUrl,omitempty"`
 }
+
+// LabelName is a valid Prometheus label name which may only contain ASCII letters, numbers, as well as underscores.
+// +kubebuilder:validation:Pattern:="^[a-zA-Z_][a-zA-Z0-9_]*$"
+type LabelName string
 
 // RelabelConfig allows dynamic rewriting of the label set, being applied to samples before ingestion.
 // It defines `<metric_relabel_configs>`-section of Prometheus configuration.
@@ -806,7 +818,7 @@ type RelabelConfig struct {
 	//The source labels select values from existing labels. Their content is concatenated
 	//using the configured separator and matched against the configured regular expression
 	//for the replace, keep, and drop actions.
-	SourceLabels []string `json:"sourceLabels,omitempty"`
+	SourceLabels []LabelName `json:"sourceLabels,omitempty"`
 	//Separator placed between concatenated source label values. default is ';'.
 	Separator string `json:"separator,omitempty"`
 	//Label to which the resulting value is written in a replace action.
@@ -820,6 +832,8 @@ type RelabelConfig struct {
 	//regular expression matches. Regex capture groups are available. Default is '$1'
 	Replacement string `json:"replacement,omitempty"`
 	// Action to perform based on regex matching. Default is 'replace'
+	//+kubebuilder:validation:Enum=replace;keep;drop;hashmod;labelmap;labeldrop;labelkeep
+	//+kubebuilder:default=replace
 	Action string `json:"action,omitempty"`
 }
 
@@ -891,7 +905,6 @@ type ServiceMonitorSpec struct {
 	// Default & fallback value: the name of the respective Kubernetes `Endpoint`.
 	JobLabel string `json:"jobLabel,omitempty"`
 	// TargetLabels transfers labels from the Kubernetes `Service` onto the created metrics.
-	// All labels set in `selector.matchLabels` are automatically transferred.
 	TargetLabels []string `json:"targetLabels,omitempty"`
 	// PodTargetLabels transfers labels on the Kubernetes `Pod` onto the created metrics.
 	PodTargetLabels []string `json:"podTargetLabels,omitempty"`
@@ -961,6 +974,8 @@ type Endpoint struct {
 	RelabelConfigs []*RelabelConfig `json:"relabelings,omitempty"`
 	// ProxyURL eg http://proxyserver:2195 Directs scrapes to proxy through this endpoint.
 	ProxyURL *string `json:"proxyUrl,omitempty"`
+	// FollowRedirects configures whether scrape requests follow HTTP 3xx redirects.
+	FollowRedirects *bool `json:"followRedirects,omitempty"`
 }
 
 // PodMonitor defines monitoring for a set of pods.
@@ -1045,6 +1060,8 @@ type PodMetricsEndpoint struct {
 	RelabelConfigs []*RelabelConfig `json:"relabelings,omitempty"`
 	// ProxyURL eg http://proxyserver:2195 Directs scrapes to proxy through this endpoint.
 	ProxyURL *string `json:"proxyUrl,omitempty"`
+	// FollowRedirects configures whether scrape requests follow HTTP 3xx redirects.
+	FollowRedirects *bool `json:"followRedirects,omitempty"`
 }
 
 // PodMetricsEndpointTLSConfig specifies TLS configuration parameters.
@@ -1121,6 +1138,26 @@ type ProbeTargets struct {
 	StaticConfig *ProbeTargetStaticConfig `json:"staticConfig,omitempty"`
 	// Ingress defines the set of dynamically discovered ingress objects which hosts are considered for probing.
 	Ingress *ProbeTargetIngress `json:"ingress,omitempty"`
+}
+
+// Validate semantically validates the given ProbeTargets.
+func (it *ProbeTargets) Validate() error {
+	if it.StaticConfig == nil && it.Ingress == nil {
+		return &ProbeTargetsValidationError{"at least one of .spec.target.staticConfig and .spec.target.ingress is required"}
+	}
+
+	return nil
+}
+
+// ProbeTargetsValidationError is returned by ProbeTargets.Validate()
+// on semantically invalid configurations.
+// +k8s:openapi-gen=false
+type ProbeTargetsValidationError struct {
+	err string
+}
+
+func (e *ProbeTargetsValidationError) Error() string {
+	return e.err
 }
 
 // ProbeTargetStaticConfig defines the set of static targets considered for probing.
@@ -1613,12 +1650,12 @@ type AlertmanagerList struct {
 	Items []Alertmanager `json:"items"`
 }
 
-// Configures the sending of series metadata to remote storage.
+// MetadataConfig configures the sending of series metadata to the remote storage.
 // +k8s:openapi-gen=true
 type MetadataConfig struct {
-	// Whether metric metadata is sent to remote storage or not.
+	// Whether metric metadata is sent to the remote storage or not.
 	Send bool `json:"send,omitempty"`
-	// How frequently metric metadata is sent to remote storage.
+	// How frequently metric metadata is sent to the remote storage.
 	SendInterval string `json:"sendInterval,omitempty"`
 }
 
@@ -1756,6 +1793,10 @@ type SafeAuthorization struct {
 
 // Validate semantically validates the given Authorization section.
 func (c *SafeAuthorization) Validate() error {
+	if c == nil {
+		return nil
+	}
+
 	if strings.ToLower(strings.TrimSpace(c.Type)) == "basic" {
 		return &AuthorizationValidationError{`Authorization type cannot be set to "basic", use "basic_auth" instead`}
 	}
